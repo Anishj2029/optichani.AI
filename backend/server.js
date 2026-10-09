@@ -1,53 +1,82 @@
 const express = require("express");
 const cors = require("cors");
+const dotenv = require("dotenv");
+const connectDB = require("./config/db");
+const authRoutes = require("./routes/authRoutes");
 const { scriptedEvents } = require("./webhook-events");
 
-const app = express();
-const PORT = 3001;
+dotenv.config();
+connectDB();
 
-app.use(cors());
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+// Open CORS
+app.use(cors({ origin: "*" }));
+
 app.use(express.json());
+
+// --- API Routes ---
+app.use("/api/auth", authRoutes);
+const analyzeRoutes = require("./routes/analyzeRoutes");
+app.use("/api/analyze", analyzeRoutes);
+
 
 // --- SSE client registry ---
 let clients = [];
 
-// --- Demo timer handles (so we can cancel on reset) ---
+// --- Demo timer handles ---
 let demoTimers = [];
+let demoStarted = false;
 
 function broadcast(event) {
   const payload = `data: ${JSON.stringify(event)}\n\n`;
-  clients.forEach((res) => res.write(payload));
-  console.log(`[broadcast] ${event.type} → ${event.data?.shipment_id || ""}`);
+  clients = clients.filter((res) => {
+    try { res.write(payload); return true; }
+    catch (_) { return false; } // drop dead connections
+  });
+  console.log(`[broadcast] ${event.type} → ${event.data?.shipment_id || ""} (${clients.length} clients)`);
 }
 
-// --- SSE endpoint (frontend connects here) ---
+// --- SSE endpoint ---
 app.get("/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // disable Nginx/Render proxy buffering
   res.flushHeaders();
 
-  // Send a heartbeat immediately so frontend knows connection is live
+  // Confirm connection immediately
   res.write(`data: ${JSON.stringify({ type: "connected", message: "SSE live" })}\n\n`);
 
   clients.push(res);
   console.log(`[SSE] client connected — total: ${clients.length}`);
 
+  // Heartbeat every 25s — keeps Render + browser connection alive
+  const heartbeat = setInterval(() => {
+    try { res.write(": ping\n\n"); } catch (_) { clearInterval(heartbeat); }
+  }, 25000);
+
+  // Start demo on first ever connection
+  if (!demoStarted) {
+    demoStarted = true;
+    startDemoScript();
+  }
+
   req.on("close", () => {
+    clearInterval(heartbeat);
     clients = clients.filter((c) => c !== res);
     console.log(`[SSE] client disconnected — total: ${clients.length}`);
   });
 });
 
-// --- Manual webhook endpoint (for judge Q&A / custom triggers) ---
+// --- Manual webhook endpoint ---
 app.post("/webhook", (req, res) => {
   const event = req.body;
-
   if (!event.shipment_id || !event.leg_id) {
     return res.status(400).json({ error: "shipment_id and leg_id are required" });
   }
-
-  const webhookEvent = {
+  broadcast({
     type: "delay",
     timestamp: new Date().toISOString(),
     source: "manual",
@@ -60,28 +89,22 @@ app.post("/webhook", (req, res) => {
       reason: event.reason,
       message: event.message || "Manual delay reported via webhook",
     },
-  };
-
-  broadcast(webhookEvent);
-  res.json({ status: "ok", event: webhookEvent });
+  });
+  res.json({ status: "ok" });
 });
 
-// --- Reset endpoint (resets demo state for all connected clients) ---
+// --- Reset endpoint ---
 app.post("/reset", (req, res) => {
-  // Cancel any pending scripted timers
   demoTimers.forEach((t) => clearTimeout(t));
   demoTimers = [];
-
-  // Tell all clients to reset their state
+  demoStarted = false;
   broadcast({ type: "reset", timestamp: new Date().toISOString() });
-
-  // Re-arm the scripted demo from scratch
+  demoStarted = true;
   startDemoScript();
-
   res.json({ status: "ok", message: "Demo reset and restarted" });
 });
 
-// --- Status endpoint (health check) ---
+// --- Health check (Render uses this to detect the service is up) ---
 app.get("/status", (req, res) => {
   res.json({
     status: "running",
@@ -90,14 +113,15 @@ app.get("/status", (req, res) => {
   });
 });
 
-// --- Start scripted demo events ---
-// Stores timer handles so they can be cancelled on reset
-function startDemoScript() {
-  console.log("\n[demo] Scripted events armed. Starting in 5 seconds...\n");
+// Root ping so Render health check passes
+app.get("/", (req, res) => res.send("BlameChain backend running"));
 
+// --- Scripted demo ---
+function startDemoScript() {
+  console.log("\n[demo] Scripted events armed. Starting in 1.5 seconds...\n");
   scriptedEvents.forEach(({ delay_ms, event }) => {
     const t = setTimeout(() => {
-      console.log(`[demo] Firing scripted event at t=${delay_ms / 1000}s`);
+      console.log(`[demo] Firing event at t=${delay_ms / 1000}s`);
       broadcast({ type: "delay", timestamp: new Date().toISOString(), source: "scripted", data: event });
     }, delay_ms);
     demoTimers.push(t);
@@ -105,11 +129,9 @@ function startDemoScript() {
 }
 
 app.listen(PORT, () => {
-  console.log(`\n✓ BlameChain webhook server running on http://localhost:${PORT}`);
-  console.log(`  SSE stream:   GET  http://localhost:${PORT}/events`);
-  console.log(`  Manual hook:  POST http://localhost:${PORT}/webhook`);
-  console.log(`  Reset demo:   POST http://localhost:${PORT}/reset`);
-  console.log(`  Health check: GET  http://localhost:${PORT}/status\n`);
-
-  startDemoScript();
+  console.log(`\n✓ BlameChain backend running on port ${PORT}`);
+  console.log(`  SSE stream:   GET  /events`);
+  console.log(`  Manual hook:  POST /webhook`);
+  console.log(`  Reset demo:   POST /reset`);
+  console.log(`  Health check: GET  /status\n`);
 });
