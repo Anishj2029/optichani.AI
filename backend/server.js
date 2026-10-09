@@ -4,6 +4,7 @@ const dotenv = require("dotenv");
 const connectDB = require("./config/db");
 const authRoutes = require("./routes/authRoutes");
 const { scriptedEvents } = require("./webhook-events");
+const { normalizeEvent, toLegacySsePayload } = require("./services/eventNormalizer");
 
 dotenv.config();
 connectDB();
@@ -72,25 +73,18 @@ app.get("/events", (req, res) => {
 
 // --- Manual webhook endpoint ---
 app.post("/webhook", (req, res) => {
-  const event = req.body;
-  if (!event.shipment_id || !event.leg_id) {
-    return res.status(400).json({ error: "shipment_id and leg_id are required" });
+  try {
+    const rawEvent = req.body;
+    // ensure message default exists before normalization
+    if (!rawEvent.message) rawEvent.message = "Manual delay reported via webhook";
+    
+    const normalized = normalizeEvent(rawEvent, { source: "manual", provider: "webhook" });
+    const legacyPayload = toLegacySsePayload(normalized);
+    broadcast(legacyPayload);
+    res.json({ status: "ok", eventId: normalized.eventId, validation: normalized.validation });
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
   }
-  broadcast({
-    type: "delay",
-    timestamp: new Date().toISOString(),
-    source: "manual",
-    data: {
-      shipment_id: event.shipment_id,
-      leg_id: event.leg_id,
-      vendor_id: event.vendor_id,
-      vendor_name: event.vendor_name,
-      delay_hours: event.delay_hours,
-      reason: event.reason,
-      message: event.message || "Manual delay reported via webhook",
-    },
-  });
-  res.json({ status: "ok" });
 });
 
 // --- Reset endpoint ---
@@ -118,11 +112,17 @@ app.get("/", (req, res) => res.send("BlameChain backend running"));
 
 // --- Scripted demo ---
 function startDemoScript() {
-  console.log("\n[demo] Scripted events armed. Starting in 1.5 seconds...\n");
+  console.log("\\n[demo] Scripted events armed. Starting in 1.5 seconds...\\n");
   scriptedEvents.forEach(({ delay_ms, event }) => {
     const t = setTimeout(() => {
       console.log(`[demo] Firing event at t=${delay_ms / 1000}s`);
-      broadcast({ type: "delay", timestamp: new Date().toISOString(), source: "scripted", data: event });
+      try {
+        const normalized = normalizeEvent(event, { source: "scripted", provider: "simulator" });
+        const legacyPayload = toLegacySsePayload(normalized);
+        broadcast(legacyPayload);
+      } catch (err) {
+        console.error("[demo] Failed to normalize scripted event:", err.message);
+      }
     }, delay_ms);
     demoTimers.push(t);
   });
